@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  schedule-api:
+    image: schedule-api:latest
+    networks:
+      - traefik-public
+    volumes:
+      - schedule-api-data:/app/data
+      - /home/streameth/schedule-api/service-account.json:/app/service-account.json:ro
+    environment:
+      - FOLDER_ID=11TpKl8skEaUC-CWBZkxJli79YX--tPsZ
+      - DB_PATH=/app/data/cache.db
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      labels:
+        # Enable Traefik
+        - traefik.enable=true
+        - traefik.docker.network=traefik-public
+        
+        # HTTP Router
+        - traefik.http.routers.schedule-api.rule=Host(`devconnect.pblvrt.com`)
+        - traefik.http.routers.schedule-api.entrypoints=websecure
+        - traefik.http.routers.schedule-api.tls=true
+        - traefik.http.routers.schedule-api.tls.certresolver=le
+        
+        # Service
+        - traefik.http.services.schedule-api.loadbalancer.server.port=8000
+        - traefik.http.services.schedule-api.loadbalancer.server.scheme=http
+        
+        # HTTP to HTTPS redirect
+        - traefik.http.routers.schedule-api-http.rule=Host(`devconnect.pblvrt.com`)
+        - traefik.http.routers.schedule-api-http.entrypoints=web
+        - traefik.http.routers.schedule-api-http.middlewares=https-redirect
+        - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+        - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+
+volumes:
+  schedule-api-data:
+
+networks:
+  traefik-public:
+    external: true
+

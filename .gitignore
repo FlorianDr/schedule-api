@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+service-account.json
+./service-account.json
+# Database
+*.db
+cache.db
+data/*.db
+data/*
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+
+# CSV files (local examples/tests)
+*.csv
+
+# Environment variables
+.env
+.env.local
