@@ -10,6 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from pydantic import BaseModel, Field
+from openai import OpenAI
 
 
 SERVICE_ACCOUNT_FILE = "service-account.json"
@@ -40,6 +42,29 @@ EXPECTED_SCHEDULE_HEADERS = [
     "Speaker 6",
     "Slides"
 ]
+
+# OpenAI API key - REQUIRED: set via environment variable OPENAI_API_KEY
+# Example: export OPENAI_API_KEY="sk-..."
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+# Pydantic models for structured output
+class Session(BaseModel):
+    """Session model matching the JSON schema."""
+    id: str = Field(default="", description="Session ID")
+    title: str = Field(description="Title of the session")
+    day: str = Field(description="Date in DD/MM/YYYY format")
+    type: str = Field(default="", description="Type of session")
+    start: str = Field(description="Start time in HH:MM format")
+    timer: str = Field(default="", description="Timer value")
+    end: str = Field(description="End time in HH:MM format")
+    speakers: List[str] = Field(default_factory=list, description="List of speaker names")
+    placeholderCardUrl: Optional[str] = Field(default=None, description="URL to placeholder card or slides")
+
+
+class SessionsResponse(BaseModel):
+    """Response containing list of sessions."""
+    sessions: List[Session] = Field(description="List of parsed sessions")
 
 
 def load_stages_mapping() -> Dict[str, str]:
@@ -101,6 +126,72 @@ def parse_time_for_sorting(time_str: str) -> tuple:
     except (ValueError, IndexError):
         pass
     return (0, 0)
+
+
+def parse_sessions_with_openai(raw_rows: List[List[str]], include_examples: bool = False) -> List[Dict[str, Any]]:
+    """
+    Parse raw sheet rows into normalized session objects using OpenAI API.
+    
+    Args:
+        raw_rows: 2D array of cell values from Google Sheets
+        include_examples: Whether to include rows starting with [EXAMPLE]
+        
+    Returns:
+        List of normalized session dictionaries
+        
+    Raises:
+        Exception: If OpenAI API call fails
+    """
+    if not raw_rows:
+        return []
+    
+    # Convert raw rows to JSON string for OpenAI
+    rows_json = json.dumps(raw_rows)
+    
+    example_instruction = "- Skip rows where title starts with [EXAMPLE]" if not include_examples else "- Include rows where title starts with [EXAMPLE]"
+    
+    system_prompt = f"""You are a data parser that extracts session information from Google Sheets data.
+
+The input is a 2D array representing rows and columns from a spreadsheet. The first row typically contains headers.
+
+Your task:
+1. Identify which columns correspond to: ID, Title, Day (date), Type, Start time, Timer, End time, Speaker columns, and Slides/Placeholder URLs
+2. Extract valid session data rows (skip instruction rows, header rows, and empty rows)
+3. For speakers: extract names from speaker columns, filtering out instruction text like "CHOSE", "ENTER", "SELECT", "⬇️", "SPEAKER 1", "SPEAKER 2", etc.
+4. Only include placeholderCardUrl if there's an actual URL value
+5. Normalize all data to match the Session schema
+6. Return all valid sessions as a structured list
+
+Important filters:
+- Skip rows where title contains "INSTRUCTIONS" or "INSTRUCTION"
+{example_instruction}
+- Skip rows that are clearly headers (like "Title of the session")
+- Skip completely empty rows
+- A valid session must have at least a title and a day"""
+
+    try:
+        completion = openai_client.beta.chat.completions.parse(
+            model="gpt-5-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Parse these sheet rows into sessions:\n\n{rows_json}"}
+            ],
+            response_format=SessionsResponse,
+        )
+        
+        result = completion.choices[0].message.parsed
+        if result and result.sessions:
+            # Convert Pydantic models to dicts, excluding None values for placeholderCardUrl
+            sessions = []
+            for session in result.sessions:
+                session_dict = session.model_dump(exclude_none=True)
+                sessions.append(session_dict)
+            return sessions
+        return []
+        
+    except Exception as e:
+        print(f"OpenAI parsing error: {e}")
+        raise
 
 
 def get_credentials():
@@ -273,24 +364,11 @@ def read_all_sheets_batch(sheets_service, spreadsheet_id: str, schedule_headers:
         "additional": {}
     }
     
-    # Process main schedule (first range)
+    # Return raw rows from main schedule (first range) for OpenAI parsing
     if value_ranges and len(value_ranges) > 0:
         rows = value_ranges[0].get("values", [])
         if rows:
-            # Similar logic to read_sheet_records
-            start_index = 0
-            if rows:
-                first_row = [c.strip() for c in rows[0]]
-                overlap = len(set(h.lower() for h in schedule_headers) & set(c.lower() for c in first_row))
-                if overlap >= max(1, len(schedule_headers) // 2):
-                    start_index = 1
-            
-            records: List[Dict[str, Any]] = []
-            for row in rows[start_index:]:
-                padded = list(row) + ([""] * (len(schedule_headers) - len(row)))
-                record = {schedule_headers[i]: padded[i] for i in range(len(schedule_headers))}
-                records.append(record)
-            response["schedule"] = records
+            response["schedule"] = rows
     
     # Process additional sheets - use the mapping to know which sheets we got
     for range_idx, sheet_name in sheet_name_mapping.items():
@@ -341,57 +419,6 @@ def is_valid_session(row: Dict[str, Any], include_examples: bool = False) -> boo
         return False
     
     return True
-
-
-def normalize_session(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a session row to match the Session JSON schema."""
-    # Map CSV headers to normalized schema keys
-    id_key = next((k for k in row.keys() if k.lower() == "id"), None)
-    title_key = next((k for k in row.keys() if k.lower().startswith("title of the session") or k.lower() == "title"), None)
-    
-    day_key = next((k for k in row.keys() if k.lower().startswith("day")), None)
-    type_key = next((k for k in row.keys() if "type" in k.lower() and "session" in k.lower()), None)
-    timer_key = next((k for k in row.keys() if k.lower() == "timer"), None)
-    start_key = next((k for k in row.keys() if k.lower().startswith("start") or k.lower() == "start"), None)
-    end_key = next((k for k in row.keys() if k.lower().startswith("end") or k.lower() == "end"), None)
-    # Speakers columns start with "Speaker "
-    speaker_keys = [k for k in row.keys() if k.lower().startswith("speaker ")]
-    # Slide/placeholder URL - check for "Slides", "Placeholder Card Url", or similar
-    slide_key = next((k for k in row.keys() if any(x in k.lower() for x in ["placeholder", "slide"])), None)
-
-    speakers: List[str] = []
-    for k in sorted(speaker_keys):
-        v = (row.get(k) or "").strip()
-        # Filter out instruction text in speaker fields
-        if v and not any(x in v.upper() for x in ["CHOSE", "ENTER", "SELECT", "⬇️", "SPEAKER 1", "SPEAKER 2"]):
-            speakers.append(v)
-
-    # Return data matching the Session JSON schema
-    session_id = (row.get(id_key) or "").strip() if id_key else ""
-    title = (row.get(title_key) or "").strip() if title_key else ""
-    day = (row.get(day_key) or "").strip() if day_key else ""
-    session_type = (row.get(type_key) or "").strip() if type_key else ""
-    timer = (row.get(timer_key) or "").strip() if timer_key else ""
-    start = (row.get(start_key) or "").strip() if start_key else ""
-    end = (row.get(end_key) or "").strip() if end_key else ""
-    
-    normalized = {
-        "id": session_id,
-        "title": title,
-        "day": day,
-        "type": session_type,
-        "start": start,
-        "timer": timer,
-        "end": end,
-        "speakers": speakers,
-    }
-    
-    # Add placeholderCardUrl only if it has a value
-    slide_url = (row.get(slide_key) or "").strip() if slide_key else ""
-    if slide_url:
-        normalized["placeholderCardUrl"] = slide_url
-    
-    return normalized
 
 
 def is_valid_row(row: Dict[str, Any], include_examples: bool = False) -> bool:
@@ -786,11 +813,9 @@ def refresh_cache() -> Dict[str, Any]:
                 # Use batch read to get all sheets in one API call
                 batch_data = read_all_sheets_batch(sheets, e["sheetId"], headers, additional_sheet_names)
                 
-                # Process main schedule
+                # Process main schedule with OpenAI (always include examples in cache, filter on read)
                 schedule_rows = batch_data.get("schedule", [])
-                normalized = [normalize_session(r) for r in schedule_rows]
-                # Filter out invalid/instruction rows
-                valid_sessions = [s for s in normalized if is_valid_session(s)]
+                valid_sessions = parse_sessions_with_openai(schedule_rows, include_examples=True)
                 upsert_schedule(e["folderId"], e["name"], e["sheetId"], headers, valid_sessions)
                 
                 # Process additional sheets
@@ -888,11 +913,9 @@ def get_event_schedule(folder_id: str, refresh: Optional[bool] = False, include_
         # Use batch read to get all sheets in one API call
         batch_data = read_all_sheets_batch(sheets, sheet_file["id"], headers, additional_sheet_names)
         
-        # Process main schedule
+        # Process main schedule with OpenAI
         schedule_rows = batch_data.get("schedule", [])
-        normalized_rows = [normalize_session(r) for r in schedule_rows]
-        # Filter out invalid/instruction rows
-        valid_rows = [s for s in normalized_rows if is_valid_session(s, include_examples=include_examples)]
+        valid_rows = parse_sessions_with_openai(schedule_rows, include_examples=include_examples)
         
         # Need event name for cache record
         # mypy/pylance cannot see dynamic methods on Resource
